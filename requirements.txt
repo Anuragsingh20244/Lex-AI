@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.0+cpu
 fastapi==0.111.0
 uvicorn==0.29.0
 python-dotenv==1.0.1
@@ -9,3 +11,4 @@ supabase==2.5.0
 pydantic==2.7.1
 python-multipart==0.0.9
 certifi
+huggingface_hub
