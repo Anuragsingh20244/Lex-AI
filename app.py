@@ -11,15 +11,19 @@ load_dotenv()
 
 # ── DOWNLOAD DATA FROM HUGGING FACE IF NOT EXISTS ──
 def download_data():
-    if not os.path.exists("data/vectordb/law_index.faiss"):
+    os.makedirs("data", exist_ok=True)
+    if not os.path.exists("data/law_index.faiss"):
         print("📥 Downloading data from Hugging Face...")
-        from huggingface_hub import snapshot_download
-        snapshot_download(
-            repo_id="anuragsingh111/Lex-AI",
-            repo_type="dataset",
-            local_dir="data",
-            local_dir_use_symlinks=False
-        )
+        from huggingface_hub import hf_hub_download
+        files = ["law_index.faiss", "chunks_meta.pkl", "all_chunks.json"]
+        for f in files:
+            print(f"  Downloading {f}...")
+            hf_hub_download(
+                repo_id="anuragsingh111/Lex-AI",
+                repo_type="dataset",
+                filename=f,
+                local_dir="data"
+            )
         print("✅ Data downloaded!")
     else:
         print("✅ Data already exists!")
@@ -37,8 +41,8 @@ app = FastAPI()
 print("🚀 Loading models...")
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-index = faiss.read_index("data/vectordb/law_index.faiss")
-with open("data/vectordb/chunks_meta.pkl", 'rb') as f:
+index = faiss.read_index("data/law_index.faiss")
+with open("data/chunks_meta.pkl", 'rb') as f:
     chunks = pickle.load(f)
 
 supabase: Client = create_client(
