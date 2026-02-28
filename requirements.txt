@@ -1,0 +1,11 @@
+fastapi==0.111.0
+uvicorn==0.29.0
+python-dotenv==1.0.1
+groq==0.9.0
+faiss-cpu==1.8.0
+sentence-transformers==3.0.1
+numpy==1.26.4
+supabase==2.5.0
+pydantic==2.7.1
+python-multipart==0.0.9
+certifi

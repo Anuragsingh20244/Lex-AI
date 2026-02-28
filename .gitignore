@@ -1,0 +1,37 @@
+# Environment — NEVER commit this
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+env/
+.venv/
+
+# Data files (too large for GitHub)
+data/raw/
+data/cleaned/
+data/vectordb/
+data/chunks/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Test files
+test_*.py
+system_check.py
+check_chunks.py
