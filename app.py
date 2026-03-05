@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from collections import defaultdict
 import time
 import os
+import httpx
 
 load_dotenv()
 
@@ -50,6 +51,8 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_ANON_KEY")
 )
 
+IK_TOKEN = os.getenv("IK_TOKEN")
+
 print("✅ Lex AI is ready!")
 
 rate_store = defaultdict(list)
@@ -71,10 +74,13 @@ LANGUAGE RULE:
 - NEVER mention language in your response
 
 ANSWER RULES:
-- Only answer based on the provided law sections
+- Answer based on the provided law sections
 - Always mention which law/section you are referencing
 - Never say someone is guilty or innocent
 - Keep answers simple and human
+- If information comes from Indian Kanoon, mention it naturally
+- If you truly don't have enough information, say: "I don't have complete information on this. Please visit indiankanoon.org or consult a lawyer."
+- NEVER make up or guess legal information
 - Do NOT add any disclaimer at the end"""
 
 class Question(BaseModel):
@@ -99,15 +105,87 @@ def search_law(query, top_k=7):
         'wages': 'minimum wages labour payment salary',
         'cybercrime': 'cyber crime IT act online fraud hacking',
         'domestic violence': 'domestic violence women protection act',
+        'article': 'constitution of india fundamental rights article',
+        'constitution': 'constitution of india fundamental rights articles',
+        '370': 'article 370 jammu kashmir constitution',
+        '21': 'article 21 right to life personal liberty constitution',
+        '19': 'article 19 freedom of speech expression constitution',
     }
     expanded = query
     for keyword, expansion in expansions.items():
         if keyword in query.lower():
             expanded = query + " " + expansion
             break
+
     embedding = embedder.encode([expanded])
     distances, indices = index.search(np.array(embedding, dtype=np.float32), top_k)
-    return [chunks[idx] for idx in indices[0]]
+
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        results.append((dist, chunks[idx]))
+    return results
+
+def is_low_confidence(results, threshold=1.0):
+    """Check if FAISS results are low confidence"""
+    if not results:
+        return True
+    best_distance = results[0][0]
+    return best_distance > threshold
+
+def needs_indian_kanoon(question: str, low_confidence: bool) -> bool:
+    """Check if we should call Indian Kanoon"""
+    # Always call for constitution articles
+    constitution_triggers = [
+        'article ', 'article-', 'constitution',
+        'fundamental right', 'directive principle',
+        'amendment', 'schedule', 'preamble'
+    ]
+    q_lower = question.lower()
+    for trigger in constitution_triggers:
+        if trigger in q_lower:
+            return True
+    # Also call if FAISS is not confident
+    return low_confidence
+
+async def search_indian_kanoon(query: str) -> str:
+    """Search Indian Kanoon API as fallback"""
+    if not IK_TOKEN:
+        return ""
+    try:
+        import urllib.parse
+        import re
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://api.indiankanoon.org/search/?formInput={encoded_query}&pagenum=0"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                url,
+                headers={"Authorization": f"Token {IK_TOKEN}"}
+            )
+
+        if response.status_code != 200:
+            print(f"Indian Kanoon error: {response.status_code}")
+            return ""
+
+        data = response.json()
+        docs = data.get("docs", [])
+
+        if not docs:
+            return ""
+
+        context = "--- Information from Indian Kanoon ---\n"
+        for doc in docs[:3]:
+            title = doc.get("title", "")
+            headline = doc.get("headline", "")
+            docsource = doc.get("docsource", "")
+            headline_clean = re.sub(r'<[^>]+>', '', headline)
+            context += f"\n[{docsource} — {title}]\n{headline_clean}\n"
+
+        return context
+
+    except Exception as e:
+        print(f"Indian Kanoon search error: {e}")
+        return ""
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -194,14 +272,36 @@ Please do not delay — contact a lawyer today."""
         return JSONResponse({"answer": answer, "conversation_id": conv_id, "status": "ok"})
 
     try:
-        relevant_laws = search_law(q.question)
-        context = ""
-        for law in relevant_laws:
-            context += f"\n[{law['source']} - {law['section']}]\n{law['content']}\n"
+        # Step 1 — Search local FAISS database
+        results_with_dist = search_law(q.question)
+        low_confidence = is_low_confidence(results_with_dist)
 
+        # Build local context
+        local_context = ""
+        for dist, law in results_with_dist:
+            local_context += f"\n[{law['source']} - {law['section']}]\n{law['content']}\n"
+
+        # Step 2 — If low confidence OR constitution query, call Indian Kanoon
+        ik_context = ""
+        if needs_indian_kanoon(q.question, low_confidence):
+            print(f"🔍 Calling Indian Kanoon for: {q.question}")
+            ik_context = await search_indian_kanoon(q.question)
+            if ik_context:
+                print("✅ Indian Kanoon returned results!")
+
+        # Step 3 — Combine contexts
+        context = local_context
+        if ik_context:
+            context += f"\n{ik_context}"
+
+        if not context.strip():
+            context = "No relevant law sections found in database."
+
+        # Step 4 — Detect language
         hindi_chars = sum(1 for c in q.question if '\u0900' <= c <= '\u097F')
         language = "Hindi" if hindi_chars > 2 else "English"
 
+        # Step 5 — Call Groq LLM
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -213,6 +313,12 @@ Please do not delay — contact a lawyer today."""
         )
 
         answer = response.choices[0].message.content
+
+        # Add Indian Kanoon credit if used
+        if ik_context:
+            answer += "\n\n📚 *Additional information sourced from Indian Kanoon*"
+
+        # Step 6 — Save to Supabase
         conv_id = None
         real_user_id = request.cookies.get("user_id")
         if real_user_id:
