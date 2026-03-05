@@ -314,9 +314,6 @@ Please do not delay — contact a lawyer today."""
 
         answer = response.choices[0].message.content
 
-        # Add Indian Kanoon credit if used
-        if ik_context:
-            answer += "\n\n📚 *Additional information sourced from Indian Kanoon*"
 
         # Step 6 — Save to Supabase
         conv_id = None
