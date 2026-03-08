@@ -74,13 +74,15 @@ LANGUAGE RULE:
 - NEVER mention language in your response
 
 ANSWER RULES:
-- Answer based on the provided law sections
+- ONLY answer using the provided law sections and context below
+- NEVER use your own training knowledge — ONLY the provided context
 - Always mention which law/section you are referencing
 - Never say someone is guilty or innocent
 - Keep answers simple and human
-- If information comes from Indian Kanoon, mention it naturally
-- If you truly don't have enough information, say: "I don't have complete information on this. Please visit indiankanoon.org or consult a lawyer."
-- NEVER make up or guess legal information
+- If the provided context does not contain enough information say EXACTLY:
+  "I don't have reliable information on this specific topic. Please visit indiankanoon.org for accurate legal information or call NALSA free legal aid: 15100"
+- NEVER guess, assume, or make up any legal information
+- NEVER reference laws or sections not present in the provided context
 - Do NOT add any disclaimer at the end"""
 
 class Question(BaseModel):
@@ -147,44 +149,97 @@ def needs_indian_kanoon(question: str, low_confidence: bool) -> bool:
     # Also call if FAISS is not confident
     return low_confidence
 
-async def search_indian_kanoon(query: str) -> str:
-    """Search Indian Kanoon API as fallback"""
+async def fetch_ik_document(tid: int) -> str:
+    """Fetch full document from Indian Kanoon by doc ID"""
+    try:
+        import re
+        url = f"https://api.indiankanoon.org/doc/{tid}/"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.post(
+                url,
+                headers={"Authorization": f"Token {IK_TOKEN}"}
+            )
+        if response.status_code != 200:
+            return ""
+        data = response.json()
+        doc_html = data.get("doc", "")
+        doc_text = re.sub(r'<[^>]+>', ' ', doc_html)
+        doc_text = re.sub(r'\s+', ' ', doc_text).strip()
+        return doc_text[:2000]
+    except Exception as e:
+        print(f"IK doc fetch error: {e}")
+        return ""
+
+async def search_indian_kanoon(query: str, constitution_mode: bool = False) -> str:
+    """Search Indian Kanoon API"""
     if not IK_TOKEN:
         return ""
     try:
         import urllib.parse
         import re
-        encoded_query = urllib.parse.quote(query)
+
+        if constitution_mode:
+            search_query = query + " doctypes:laws"
+        else:
+            search_query = query
+
+        encoded_query = urllib.parse.quote(search_query)
         url = f"https://api.indiankanoon.org/search/?formInput={encoded_query}&pagenum=0"
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.post(
                 url,
                 headers={"Authorization": f"Token {IK_TOKEN}"}
             )
 
         if response.status_code != 200:
-            print(f"Indian Kanoon error: {response.status_code}")
             return ""
 
         data = response.json()
         docs = data.get("docs", [])
-
         if not docs:
             return ""
 
-        context = "--- Information from Indian Kanoon ---\n"
-        for doc in docs[:3]:
-            title = doc.get("title", "")
-            headline = doc.get("headline", "")
-            docsource = doc.get("docsource", "")
-            headline_clean = re.sub(r'<[^>]+>', '', headline)
-            context += f"\n[{docsource} — {title}]\n{headline_clean}\n"
+        context = "--- Indian Kanoon ---\n"
+
+        if constitution_mode:
+            # Find the actual Constitution document first
+            constitution_doc = None
+            for doc in docs:
+                docsource = doc.get("docsource", "")
+                title = doc.get("title", "")
+                if "Constitution" in docsource or "Constitution" in title:
+                    constitution_doc = doc
+                    break
+
+            if constitution_doc:
+                tid = constitution_doc.get("tid")
+                title = constitution_doc.get("title", "")
+                if tid:
+                    full_text = await fetch_ik_document(tid)
+                    if full_text:
+                        context += f"\n[Constitution of India — {title}]\n{full_text}\n"
+                        return context
+
+            # Fallback to headlines
+            for doc in docs[:2]:
+                title = doc.get("title", "")
+                headline = doc.get("headline", "")
+                docsource = doc.get("docsource", "")
+                headline_clean = re.sub(r'<[^>]+>', '', headline).strip()
+                context += f"\n[{docsource} — {title}]\n{headline_clean}\n"
+        else:
+            for doc in docs[:2]:
+                title = doc.get("title", "")
+                headline = doc.get("headline", "")
+                docsource = doc.get("docsource", "")
+                headline_clean = re.sub(r'<[^>]+>', '', headline).strip()
+                context += f"\n[{docsource} — {title}]\n{headline_clean}\n"
 
         return context
 
     except Exception as e:
-        print(f"Indian Kanoon search error: {e}")
+        print(f"Indian Kanoon error: {e}")
         return ""
 
 @app.get("/", response_class=HTMLResponse)
@@ -272,50 +327,68 @@ Please do not delay — contact a lawyer today."""
         return JSONResponse({"answer": answer, "conversation_id": conv_id, "status": "ok"})
 
     try:
-        # Step 1 — Search local FAISS database
-        results_with_dist = search_law(q.question)
-        low_confidence = is_low_confidence(results_with_dist)
+        import re as re2
+        # Detect if this is a Constitution article query
+        article_match = re2.search(r'article\s+(\d+)', q.question.lower())
+        is_constitution_query = article_match is not None
 
-        # Build local context
+        # Step 1 — Skip FAISS for constitution articles, use directly for others
         local_context = ""
-        for dist, law in results_with_dist:
-            local_context += f"\n[{law['source']} - {law['section']}]\n{law['content']}\n"
+        if not is_constitution_query:
+            results_with_dist = search_law(q.question)
+            low_confidence = is_low_confidence(results_with_dist)
+            for dist, law in results_with_dist:
+                local_context += f"\n[{law['source']} - {law['section']}]\n{law['content']}\n"
+        else:
+            low_confidence = True
 
-        # Step 2 — If low confidence OR constitution query, call Indian Kanoon
+        # Step 2 — Call Indian Kanoon when needed
         ik_context = ""
         if needs_indian_kanoon(q.question, low_confidence):
-            print(f"🔍 Calling Indian Kanoon for: {q.question}")
-            ik_context = await search_indian_kanoon(q.question)
+            print(f"Calling Indian Kanoon for: {q.question}")
+            ik_context = await search_indian_kanoon(q.question, constitution_mode=is_constitution_query)
+
+        # Step 3 — Build context smartly
+        if is_constitution_query and ik_context:
+            context = ik_context  # ONLY use Indian Kanoon for articles
+        else:
+            context = local_context
             if ik_context:
-                print("✅ Indian Kanoon returned results!")
+                context += f"\n{ik_context}"
 
-        # Step 3 — Combine contexts
-        context = local_context
-        if ik_context:
-            context += f"\n{ik_context}"
-
-        if not context.strip():
-            context = "No relevant law sections found in database."
+        # Context validation — don't call LLM if context is too poor
+        if not context.strip() or len(context.strip()) < 100:
+            return JSONResponse({
+                "answer": "I don't have reliable information on this specific topic. Please visit indiankanoon.org for accurate legal information or call NALSA free legal aid: 15100",
+                "conversation_id": None,
+                "status": "ok"
+            })
 
         # Step 4 — Detect language
         hindi_chars = sum(1 for c in q.question if '\u0900' <= c <= '\u097F')
         language = "Hindi" if hindi_chars > 2 else "English"
 
-        # Step 5 — Call Groq LLM
+        # Step 5 — Build prompt (special for constitution articles)
+        if is_constitution_query and article_match:
+            article_num = article_match.group(1)
+            user_prompt = f"IMPORTANT: Reply strictly in {language} only.\n\nThe user is asking about Article {article_num} of the Constitution of India. Use ONLY the information below. Do NOT reference RTI or any other unrelated law.\n\nInformation:\n{context}\n\nQuestion: {q.question}"
+        else:
+            user_prompt = f"IMPORTANT: Reply strictly in {language} only.\n\nLaw sections:\n{context}\n\nQuestion: {q.question}"
+
+        # Step 6 — Call Groq LLM
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"IMPORTANT: Reply strictly in {language} only.\n\nLaw sections:\n{context}\n\nQuestion: {q.question}"}
+                {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3,
+            temperature=0.0,
             max_tokens=1000
         )
 
         answer = response.choices[0].message.content
 
-
-        # Step 6 — Save to Supabase
+        # Step 7 — Save to Supabase
         conv_id = None
         real_user_id = request.cookies.get("user_id")
         if real_user_id:
@@ -350,3 +423,109 @@ async def feedback(request: Request):
         return JSONResponse({"status": "ok"})
     except Exception as e:
         return JSONResponse({"status": "error"})
+
+# ── CASE ANALYSIS FEATURE ──
+
+class CaseDetails(BaseModel):
+    what_happened: str
+    role: str          # "victim" or "accused"
+    fir_filed: str     # "yes", "no", "not sure"
+    state: str
+    charges: str       # optional, can be empty
+
+ANALYZE_PROMPT = """You are Lex AI, an expert Indian legal analyst.
+
+A person has described their legal situation. Analyze it thoroughly and provide:
+
+1. 📋 CASE SUMMARY — Summarize the situation in 2-3 lines
+2. ⚖️ APPLICABLE LAWS — Which Indian laws and sections apply
+3. 💪 STRONGEST ARGUMENTS — Top 3 legal arguments for their position
+4. ⚠️ RISKS & CHALLENGES — What they should be careful about
+5. 📝 RECOMMENDED STEPS — Exact step-by-step actions to take
+6. 🆘 WHEN TO GET A LAWYER — Be specific about when professional help is essential
+
+RULES:
+- Base analysis on provided law sections and Indian Kanoon data
+- Be specific — mention actual section numbers
+- Never declare guilt or innocence
+- Be practical and actionable
+- Match the language of the user (Hindi/English)
+- Do NOT add disclaimer at the end"""
+
+@app.post("/analyze")
+async def analyze_case(case: CaseDetails, request: Request):
+    user_id = request.cookies.get("user_id") or request.client.host
+
+    if is_rate_limited(user_id):
+        return JSONResponse({
+            "analysis": "⚠️ Rate limit reached. Please try again after an hour.\n\nFree legal aid: NALSA Helpline 15100",
+            "status": "rate_limited"
+        })
+
+    try:
+        # Build full case description
+        full_case = f"""
+Situation: {case.what_happened}
+Role: {case.role}
+FIR Filed: {case.fir_filed}
+State: {case.state}
+Charges mentioned: {case.charges if case.charges else 'Not specified'}
+"""
+
+        # Search FAISS for relevant laws
+        results = search_law(case.what_happened, top_k=10)
+        local_context = ""
+        for dist, law in results:
+            local_context += f"\n[{law['source']} - {law['section']}]\n{law['content']}\n"
+
+        # Also search Indian Kanoon for relevant cases
+        ik_context = await search_indian_kanoon(case.what_happened)
+
+        # Combine context
+        context = local_context
+        if ik_context:
+            context += f"\n{ik_context}"
+
+        # Detect language
+        hindi_chars = sum(1 for c in case.what_happened if '\u0900' <= c <= '\u097F')
+        language = "Hindi" if hindi_chars > 2 else "English"
+
+        # Call Groq for analysis
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": ANALYZE_PROMPT},
+                {"role": "user", "content": f"Reply in {language} only.\n\nCase Details:\n{full_case}\n\nRelevant Law Sections:\n{context}\n\nProvide complete legal analysis."}
+            ],
+            temperature=0.0,
+            max_tokens=2000
+        )
+
+        analysis = response.choices[0].message.content
+
+        # Save to Supabase
+        conv_id = None
+        real_user_id = request.cookies.get("user_id")
+        if real_user_id:
+            try:
+                result = supabase.table("conversations").insert({
+                    "user_id": real_user_id,
+                    "question": f"[CASE ANALYSIS] {case.what_happened[:200]}",
+                    "answer": analysis
+                }).execute()
+                conv_id = result.data[0]['id'] if result.data else None
+            except:
+                pass
+
+        return JSONResponse({
+            "analysis": analysis,
+            "conversation_id": conv_id,
+            "status": "ok"
+        })
+
+    except Exception as e:
+        print(f"Analyze error: {e}")
+        return JSONResponse({
+            "analysis": "Something went wrong. Please try again.",
+            "status": "error"
+        })
